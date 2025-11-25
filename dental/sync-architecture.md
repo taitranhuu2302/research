@@ -35,8 +35,9 @@ Module sync data từ nhiều PMS (Practice Management System) khác nhau vào h
 │              Azure Function (Webhook Receiver)                   │
 │  - Validate HMAC/Signature                                       │
 │  - Extract Tenant ID from webhook                               │
-│  - Enrich message (CorrelationId, ReceivedAt, etc.)            │
-│  - Push to Service Bus                                          │
+│  - Encrypt PII/PHI data (HIPAA compliance)                       │
+│  - Enrich message (PmsConnectionId, TenantId, PmsType, etc.)   │
+│  - Push encrypted message to Service Bus                        │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
@@ -107,10 +108,12 @@ Module sync data từ nhiều PMS (Practice Management System) khác nhau vào h
 │  │                      │                                    │  │
 │  │                      ▼                                    │  │
 │  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │  Application Service Layer                        │  │  │
-│  │  │  - HandleWebhookAsync()                           │  │  │
-│  │  │  - Create/Update domain entities                 │  │  │
-│  │  │  - Publish domain events                          │  │  │
+│  │  │  MediatR CQRS Layer                                │  │  │
+│  │  │  - ProcessWebhookCommand                          │  │  │
+│  │  │  - ExtractDataCommand / LoadDataCommand          │  │  │
+│  │  │  - TransformDataCommand                           │  │  │
+│  │  │  - SyncPatientCommand / SyncAppointmentCommand   │  │  │
+│  │  │  - Publish domain events via MediatR             │  │  │
 │  │  └───────────────────┬────────────────────────────────┘  │  │
 │  └──────────────────────┼────────────────────────────────────┘  │
 │                         │                                        │
@@ -253,20 +256,45 @@ Dental.PmsSync/
 │   │   ├── DentrixAdapter.cs            // Dentrix implementation (future)
 │   │   └── EaglesoftAdapter.cs          // Eaglesoft implementation (future)
 │   │
-│   ├── Services/
-│   │   ├── IPmsSyncService.cs           // Main sync service
-│   │   ├── PmsSyncService.cs
-│   │   ├── IExtractService.cs            // Extract layer
-│   │   ├── ExtractService.cs
-│   │   ├── ILoadService.cs               // Load layer
-│   │   ├── LoadService.cs
-│   │   ├── ITransformService.cs          // Transform layer
-│   │   └── TransformService.cs
+│   ├── Commands/
+│   │   ├── ProcessWebhook/
+│   │   │   ├── ProcessWebhookCommand.cs
+│   │   │   └── ProcessWebhookCommandHandler.cs
+│   │   ├── ExtractData/
+│   │   │   ├── ExtractDataCommand.cs
+│   │   │   └── ExtractDataCommandHandler.cs
+│   │   ├── LoadData/
+│   │   │   ├── LoadDataCommand.cs
+│   │   │   └── LoadDataCommandHandler.cs
+│   │   ├── TransformData/
+│   │   │   ├── TransformDataCommand.cs
+│   │   │   └── TransformDataCommandHandler.cs
+│   │   ├── SyncPatient/
+│   │   │   ├── SyncPatientCommand.cs
+│   │   │   └── SyncPatientCommandHandler.cs
+│   │   ├── SyncAppointment/
+│   │   │   ├── SyncAppointmentCommand.cs
+│   │   │   └── SyncAppointmentCommandHandler.cs
+│   │   └── SyncTreatmentPlan/
+│   │       ├── SyncTreatmentPlanCommand.cs
+│   │       └── SyncTreatmentPlanCommandHandler.cs
+│   │
+│   ├── Queries/
+│   │   ├── GetPmsConnection/
+│   │   │   ├── GetPmsConnectionQuery.cs
+│   │   │   └── GetPmsConnectionQueryHandler.cs
+│   │   ├── GetPmsRawData/
+│   │   │   ├── GetPmsRawDataQuery.cs
+│   │   │   └── GetPmsRawDataQueryHandler.cs
+│   │   └── GetPmsEntityMapping/
+│   │       ├── GetPmsEntityMappingQuery.cs
+│   │       └── GetPmsEntityMappingQueryHandler.cs
 │   │
 │   ├── DTOs/
 │   │   ├── WebhookMessageDto.cs
 │   │   ├── RawDataDto.cs
-│   │   └── SyncResultDto.cs
+│   │   ├── SyncResultDto.cs
+│   │   └── TransformResultDto.cs
 │   │
 │   └── BackgroundWorkers/
 │       └── ServiceBusConsumerWorker.cs   // Service Bus consumer
@@ -686,13 +714,21 @@ public class ServiceBusConsumerWorker : BackgroundService
     private async Task ProcessMessageAsync(ProcessMessageEventArgs args)
     {
         using var scope = _serviceProvider.CreateScope();
-        var syncService = scope.ServiceProvider.GetRequiredService<IPmsSyncService>();
+        var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
         
         try
         {
             var message = JsonSerializer.Deserialize<WebhookMessageDto>(args.Message.Body.ToString());
             
-            await syncService.ProcessWebhookAsync(message);
+            var command = new ProcessWebhookCommand
+            {
+                Payload = message.Payload,
+                WebhookUrl = message.WebhookUrl,
+                CorrelationId = message.CorrelationId,
+                ReceivedAt = message.ReceivedAt
+            };
+            
+            await mediator.Send(command);
             
             await args.CompleteMessageAsync(args.Message);
         }
@@ -708,63 +744,86 @@ public class ServiceBusConsumerWorker : BackgroundService
 
 ---
 
-## 📊 Sync Service (Orchestrator)
+## 📊 MediatR Command Orchestration
+
+### **ProcessWebhookCommand (Orchestrator)**
 
 ```csharp
-public class PmsSyncService : IPmsSyncService
+public class ProcessWebhookCommand : IRequest<SyncResult>
 {
-    private readonly IExtractService _extractService;
-    private readonly ILoadService _loadService;
-    private readonly ITransformService _transformService;
+    public string Payload { get; set; }
+    public string? WebhookUrl { get; set; }
+    public string? CorrelationId { get; set; }
+    public DateTime ReceivedAt { get; set; }
+}
+
+public class ProcessWebhookCommandHandler : IRequestHandler<ProcessWebhookCommand, SyncResult>
+{
+    private readonly IMediator _mediator;
     private readonly IPmsConnectionRepository _connectionRepository;
-    private readonly IPmsSyncLogRepository _syncLogRepository;
     
-    public async Task<SyncResult> ProcessWebhookAsync(WebhookMessageDto message)
+    public async Task<SyncResult> Handle(ProcessWebhookCommand request, CancellationToken cancellationToken)
     {
-        var correlationId = message.CorrelationId ?? Guid.NewGuid().ToString();
+        var correlationId = request.CorrelationId ?? Guid.NewGuid().ToString();
         var startTime = DateTime.UtcNow;
         
         try
         {
-            // 1. Get PMS connection
-            var connection = await _connectionRepository.GetByWebhookUrlAsync(message.WebhookUrl);
+            // 1. Get PMS connection (Query)
+            var connectionQuery = new GetPmsConnectionByWebhookUrlQuery 
+            { 
+                WebhookUrl = request.WebhookUrl 
+            };
+            var connection = await _mediator.Send(connectionQuery, cancellationToken);
+            
             if (connection == null || !connection.IsActive)
             {
                 throw new PmsConnectionNotFoundException();
             }
             
-            // 2. EXTRACT
-            var entityType = DetermineEntityType(message.Payload);
-            var extractedData = await _extractService.ExtractAsync(
-                message.Payload,
-                connection.PmsType,
-                entityType);
+            // 2. EXTRACT (Command)
+            var extractCommand = new ExtractDataCommand
+            {
+                RawJsonPayload = request.Payload,
+                PmsType = connection.PmsType,
+                EntityType = DetermineEntityType(request.Payload)
+            };
+            var extractedData = await _mediator.Send(extractCommand, cancellationToken);
             
-            // 3. LOAD (Landing Zone)
-            var rawData = await _loadService.LoadAsync(
-                tenantId: connection.TenantId,
-                pmsConnectionId: connection.Id,
-                pmsType: connection.PmsType,
-                entityType: entityType,
-                rawJsonPayload: message.Payload,
-                extractedData: extractedData,
-                correlationId: correlationId);
+            // 3. LOAD (Command)
+            var loadCommand = new LoadDataCommand
+            {
+                TenantId = connection.TenantId,
+                PmsConnectionId = connection.Id,
+                PmsType = connection.PmsType,
+                EntityType = extractCommand.EntityType,
+                RawJsonPayload = request.Payload,
+                ExtractedData = extractedData,
+                CorrelationId = correlationId
+            };
+            var rawData = await _mediator.Send(loadCommand, cancellationToken);
             
-            // 4. TRANSFORM
-            var transformResult = await _transformService.TransformAsync(rawData, extractedData);
+            // 4. TRANSFORM (Command)
+            var transformCommand = new TransformDataCommand
+            {
+                RawData = rawData,
+                ExtractedData = extractedData
+            };
+            var transformResult = await _mediator.Send(transformCommand, cancellationToken);
             
             // 5. Update raw data status
             rawData.MarkAsCompleted(transformResult.EntityId, transformResult.EntityType);
             await _rawDataRepository.UpdateAsync(rawData);
             
-            // 6. Log success
-            await LogSyncAsync(rawData, SyncStatus.Completed, null, startTime);
-            
-            return new SyncResult { Success = true, CorrelationId = correlationId };
+            return new SyncResult 
+            { 
+                Success = true, 
+                CorrelationId = correlationId 
+            };
         }
         catch (Exception ex)
         {
-            await LogSyncAsync(null, SyncStatus.Failed, ex.Message, startTime);
+            // Log error via MediatR notification or logging behavior
             throw;
         }
     }
@@ -805,9 +864,18 @@ public class PmsSyncService : IPmsSyncService
    - Validate tenant ID từ webhook
    - Use ABP's multi-tenant context switching
 
-3. **Data Encryption**
-   - Encrypt sensitive fields (PII/PHI) trong domain entities
-   - Use ABP's encryption attributes
+3. **Data Encryption (HIPAA Compliance)**
+   - **Azure Function**: Encrypt PII/PHI data trước khi push vào Service Bus
+     - Field-level encryption cho sensitive fields (name, SSN, DOB, address, phone, email)
+     - Use Azure Key Vault cho encryption keys
+     - Support key rotation và versioning
+   - **Service Bus**: Encryption at rest (automatic)
+   - **App**: Decrypt PII/PHI data sau khi đọc từ Service Bus
+     - Use Azure Key Vault cho decryption keys
+     - Validate decrypted data
+   - **Domain Layer**: Encrypt sensitive fields trong domain entities
+     - Use ABP's encryption attributes
+     - Store encrypted data trong database
 
 4. **Access Control**
    - Role-based access cho sync operations
@@ -866,21 +934,33 @@ public class PmsSyncService : IPmsSyncService
 - [ ] Implement extraction logic
 - [ ] Unit tests
 
-### **Phase 3: ELT Pipeline**
-- [ ] Implement ExtractService
-- [ ] Implement LoadService (Landing Zone)
-- [ ] Implement TransformService
-- [ ] Implement PmsSyncService (orchestrator)
+### **Phase 3: ELT Pipeline với MediatR CQRS (với HIPAA Decryption)**
+- [ ] Implement ExtractDataCommand & Handler
+- [ ] Implement LoadDataCommand & Handler (Landing Zone)
+- [ ] Implement TransformDataCommand & Handler
+- [ ] Implement ProcessWebhookCommand & Handler (orchestrator)
+  - [ ] PII/PHI data decryption (HIPAA compliance)
+  - [ ] Azure Key Vault integration for decryption
+- [ ] Implement SyncPatientCommand & Handler
+- [ ] Implement SyncAppointmentCommand & Handler
+- [ ] Implement SyncTreatmentPlanCommand & Handler
+- [ ] Implement Pipeline Behaviors (Validation, Logging, Transaction)
 
 ### **Phase 4: Service Bus Integration**
 - [ ] Setup Azure Service Bus
 - [ ] Implement ServiceBusConsumerWorker
 - [ ] Error handling & retry logic
 
-### **Phase 5: Webhook Receiver**
+### **Phase 5: Webhook Receiver (với HIPAA Encryption)**
 - [ ] Azure Function for webhook
 - [ ] HMAC validation
-- [ ] Message enrichment
+- [ ] PII/PHI data encryption (HIPAA compliance)
+  - [ ] Identify sensitive fields
+  - [ ] Azure Key Vault integration
+  - [ ] Field-level encryption implementation
+  - [ ] Key rotation support
+- [ ] Message enrichment (PmsConnectionId, TenantId, PmsType)
+- [ ] Push encrypted message to Service Bus
 
 ### **Phase 6: Monitoring & Observability**
 - [ ] Logging implementation
